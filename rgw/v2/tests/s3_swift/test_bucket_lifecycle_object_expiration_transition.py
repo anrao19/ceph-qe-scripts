@@ -498,7 +498,7 @@ def test_exec(config, ssh_con):
                 not config.parallel_lc
                 and config.test_ops.get("send_bucket_notifications", False) is True
             ):
-                notification.verify(bucket_name)
+                notification.verify(bucket_name, config)
         if config.parallel_lc:
             log.info("Inside parallel lc processing")
             life_cycle_rule = {"Rules": config.lifecycle_conf}

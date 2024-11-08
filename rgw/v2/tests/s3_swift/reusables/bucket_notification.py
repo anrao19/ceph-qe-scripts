@@ -451,7 +451,7 @@ class NotificationService:
         log.info(f"get bucket notification for bucket : {bucket_name}")
         get_bucket_notification(self.rgw_s3_client, bucket_name)
 
-    def verify(self, bucket_name):
+    def verify(self, bucket_name, config):
         # start kafka broker and consumer
         event_record_path = "/tmp/event_record"
         topic_name = self.bucket_topic_map[bucket_name]["topic_name"]
@@ -463,7 +463,7 @@ class NotificationService:
         # verify all the attributes of the event record. if event not received abort testcase
         log.info("verify event record attributes")
         verify = verify_event_record(
-            event, bucket_name, event_record_path, self.ceph_version_name
+            event, bucket_name, event_record_path, self.ceph_version_name, config
         )
         if verify is False:
             raise EventRecordDataError(
