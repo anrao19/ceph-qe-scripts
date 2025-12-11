@@ -6,9 +6,11 @@ import glob
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from configparser import RawConfigParser
 from pathlib import Path
@@ -1171,3 +1173,378 @@ def delete_bucket_s3_replication(aws_auth, bucket_name, end_point):
         return delete_response
     except Exception as e:
         raise AWSCommandExecError(message=str(e))
+
+
+def set_lua_script(context, script_content=None, script_file=None, rgw_realm=None):
+    """
+    Set a Lua script using radosgw-admin.
+
+    Parameters:
+        context (str): Script context - must be "prerequest", "postrequest", "background", "getdata", or "putdata"
+        script_content (str, optional): Lua script content as a string
+        script_file (str, optional): Path to a file containing the Lua script
+        rgw_realm (str, optional): RGW realm name
+
+    Returns:
+        str: Output from the radosgw-admin command
+
+    Raises:
+        TestExecError: If script setting fails or if both script_content and script_file are provided
+    """
+    valid_contexts = ["prerequest", "postrequest", "background", "getdata", "putdata"]
+    if context not in valid_contexts:
+        raise TestExecError(f"Context must be one of {valid_contexts}, got: {context}")
+    
+    if script_content and script_file:
+        raise TestExecError("Cannot specify both script_content and script_file. Use only one.")
+    
+    if not script_content and not script_file:
+        raise TestExecError("Either script_content or script_file must be provided.")
+
+    log.info(f"Setting Lua script with context: {context}")
+
+    # Build the base command
+    cmd = f"radosgw-admin script put --context={context}"
+    if rgw_realm:
+        cmd += f" --rgw-realm={rgw_realm}"
+
+    # Add script content or file
+    if script_file:
+        if not os.path.exists(script_file):
+            raise TestExecError(f"Script file not found: {script_file}")
+        cmd += f" --infile={script_file}"
+        log.info(f"Using script file: {script_file}")
+    else:
+        # Write script content to a temporary file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.lua', delete=False) as tmp_file:
+            tmp_file.write(script_content)
+            tmp_script_file = tmp_file.name
+        
+        cmd += f" --infile={tmp_script_file}"
+        log.info(f"Using inline script content (written to temp file: {tmp_script_file})")
+
+    # Execute the command
+    out = utils.exec_shell_cmd(cmd)
+    
+    # Clean up temporary file if we created one
+    if script_content and 'tmp_script_file' in locals():
+        try:
+            os.unlink(tmp_script_file)
+        except OSError:
+            pass
+
+    if out is False:
+        raise TestExecError(f"Failed to set Lua script with context {context}")
+    
+    log.info(f"Successfully set Lua script with context {context}")
+    return out
+
+
+def get_lua_script(context, rgw_realm=None):
+    """
+    Get a Lua script using radosgw-admin.
+
+    Parameters:
+        context (str): Script context - must be "prerequest", "postrequest", "background", "getdata", or "putdata"
+        rgw_realm (str, optional): RGW realm name
+
+    Returns:
+        str: The Lua script content
+
+    Raises:
+        TestExecError: If script retrieval fails
+    """
+    valid_contexts = ["prerequest", "postrequest", "background", "getdata", "putdata"]
+    if context not in valid_contexts:
+        raise TestExecError(f"Context must be one of {valid_contexts}, got: {context}")
+
+    log.info(f"Getting Lua script with context: {context}")
+
+    # Build the command
+    cmd = f"radosgw-admin script get --context={context}"
+    if rgw_realm:
+        cmd += f" --rgw-realm={rgw_realm}"
+
+    # Execute the command
+    out = utils.exec_shell_cmd(cmd)
+
+    if out is False:
+        raise TestExecError(f"Failed to get Lua script with context {context}")
+    
+    log.info(f"Successfully retrieved Lua script with context {context}")
+    return out
+
+
+def remove_lua_script(context, rgw_realm=None):
+    """
+    Remove a Lua script using radosgw-admin.
+
+    Parameters:
+        context (str): Script context - must be "prerequest", "postrequest", "background", "getdata", or "putdata"
+        rgw_realm (str, optional): RGW realm name
+
+    Returns:
+        str: Output from the radosgw-admin command
+
+    Raises:
+        TestExecError: If script removal fails
+    """
+    valid_contexts = ["prerequest", "postrequest", "background", "getdata", "putdata"]
+    if context not in valid_contexts:
+        raise TestExecError(f"Context must be one of {valid_contexts}, got: {context}")
+
+    log.info(f"Removing Lua script with context: {context}")
+
+    # Build the command
+    cmd = f"radosgw-admin script rm --context={context}"
+    if rgw_realm:
+        cmd += f" --rgw-realm={rgw_realm}"
+
+    # Execute the command
+    out = utils.exec_shell_cmd(cmd)
+
+    if out is False:
+        raise TestExecError(f"Failed to remove Lua script with context {context}")
+    
+    log.info(f"Successfully removed Lua script with context {context}")
+    return out
+
+
+def create_storage_class_single_site(pool_name, storage_class):
+    """
+    Create storage class in a single site cluster.
+    
+    This function sets up storage class prerequisites for object placement
+    in a single site RGW cluster. Works for clusters with or without realm configuration.
+    
+    Parameters:
+        pool_name (str): Name of the OSD pool to create
+        storage_class (str): Name of the storage class to create
+    
+    Returns:
+        None
+    
+    Raises:
+        TestExecError: If storage class creation fails
+    """
+    log.info(f"Creating storage class '{storage_class}' for single site cluster")
+    log.info(f"Pool name: {pool_name}")
+
+    # Get zonegroup and zone name from sync status
+    op = utils.exec_shell_cmd("radosgw-admin sync status")
+    lines = list(op.split("\n"))
+    zonegroup = None
+    current_zone = None
+    
+    for line in lines:
+        if "zonegroup" in line.lower():
+            zonegroup = line[line.find("(") + 1 : line.find(")")]
+        elif "zone" in line.lower() and "zonegroup" not in line.lower():
+            # Extract zone name, avoiding zonegroup lines
+            current_zone = line[line.find("(") + 1 : line.find(")")]
+    
+    if not zonegroup or not current_zone:
+        raise TestExecError("Could not retrieve zonegroup or zone name from sync status")
+    
+    log.info(f"Retrieved zonegroup name: {zonegroup} and zone name: {current_zone}")
+    
+    # Get zone info for storage class check
+    zone_out = None
+    try:
+        zone_out = json.loads(utils.exec_shell_cmd("radosgw-admin zone get"))
+    except Exception as e:
+        log.warning(f"Could not get zone info: {e}")
+    
+    # Get zonegroup info for storage class check
+    zonegroup_out = None
+    try:
+        zonegroup_out = json.loads(utils.exec_shell_cmd(f"radosgw-admin zonegroup get --rgw-zonegroup {zonegroup}"))
+    except Exception as e:
+        log.warning(f"Could not get zonegroup info: {e}")
+    
+    # Check if storage class already exists in zonegroup placement
+    storage_class_exists_in_zg = False
+    if zonegroup_out:
+        for placement in zonegroup_out.get("placement_targets", []):
+            if placement.get("key") == "default-placement":
+                storage_classes = placement.get("val", {}).get("storage_classes", [])
+                if storage_class in storage_classes:
+                    storage_class_exists_in_zg = True
+                    log.info(f"Storage class '{storage_class}' already exists in zonegroup '{zonegroup}' placement")
+                    break
+    
+    # Add storage class to zonegroup placement if it doesn't exist
+    if not storage_class_exists_in_zg:
+        log.info(f"Adding storage class to zonegroup '{zonegroup}' placement")
+        try:
+            utils.exec_shell_cmd(
+                f"radosgw-admin zonegroup placement add --rgw-zonegroup {zonegroup} "
+                f"--placement-id default-placement --storage-class {storage_class}"
+            )
+        except Exception as e:
+            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                log.info(f"Storage class '{storage_class}' already exists in zonegroup, skipping addition")
+            else:
+                raise
+    else:
+        log.info(f"Storage class '{storage_class}' already exists in zonegroup, skipping addition")
+    
+    # Check if storage class already exists in zone placement (reuse zone_out from above)
+    storage_class_exists_in_zone = False
+    if zone_out:
+        for placement in zone_out.get("placement_pools", []):
+            if placement.get("key") == "default-placement":
+                storage_classes = placement.get("val", {}).get("storage_classes", {})
+                if storage_class in storage_classes:
+                    storage_class_exists_in_zone = True
+                    log.info(f"Storage class '{storage_class}' already exists in zone '{current_zone}' placement")
+                    break
+    
+    # Add storage class to zone placement if it doesn't exist
+    if not storage_class_exists_in_zone:
+        log.info(f"Adding storage class to zone '{current_zone}' placement")
+        try:
+            utils.exec_shell_cmd(
+                f"radosgw-admin zone placement add --rgw-zone {current_zone} "
+                f"--placement-id default-placement --storage-class {storage_class} "
+                f"--data-pool {pool_name}"
+            )
+        except Exception as e:
+            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                log.info(f"Storage class '{storage_class}' already exists in zone, skipping addition")
+            else:
+                raise
+    else:
+        log.info(f"Storage class '{storage_class}' already exists in zone, skipping addition")
+    
+    # Create OSD pool (check if it already exists first)
+    log.info(f"Creating OSD pool: {pool_name}")
+    try:
+        utils.exec_shell_cmd(f"ceph osd pool create {pool_name}")
+    except Exception as e:
+        if "already exists" in str(e).lower() or "EEXIST" in str(e):
+            log.info(f"Pool {pool_name} already exists, skipping creation")
+        else:
+            raise
+    
+    # Enable RGW application on the pool
+    log.info(f"Enabling RGW application on pool: {pool_name}")
+    utils.exec_shell_cmd(f"ceph osd pool application enable {pool_name} rgw")
+    log.info(f"Successfully created storage class '{storage_class}' for single site cluster")
+
+
+def extract_debug_pattern_from_lua_script(lua_script_content):
+    """
+    Extract debug log pattern from lua script by parsing RGWDebugLog statements.
+    Returns regex pattern to match debug log messages.
+    Raises TestExecError if RGWDebugLog statement is not found or cannot be parsed.
+    """
+    
+    if not lua_script_content:
+        raise TestExecError("lua_script_content is empty. Cannot extract debug pattern.")
+    
+    # Find RGWDebugLog statement (can span multiple lines)
+    rgw_debug_pattern = r'RGWDebugLog\s*\((.*?)\)'
+    match = re.search(rgw_debug_pattern, lua_script_content, re.DOTALL)
+    
+    if not match:
+        raise TestExecError("No RGWDebugLog statement found in lua script. Cannot extract debug pattern.")
+    
+    debug_log_content = match.group(1)
+    
+    # Extract string literals from RGWDebugLog statement
+    string_literals = re.findall(r'["\']([^"\']*)["\']', debug_log_content)
+    
+    if not string_literals:
+        raise TestExecError("No string literals found in RGWDebugLog statement. Cannot extract debug pattern.")
+    
+    # Build pattern: match string literals in order, variable parts matched with .*
+    pattern_parts = []
+    for literal in string_literals:
+        escaped = re.escape(literal)
+        pattern_parts.append(escaped)
+    
+    # Pattern format: "Lua INFO:.*<first_literal>.*<second_literal>.*..."
+    pattern = r"Lua INFO:.*" + r".*".join(pattern_parts)
+    
+    log.info(f"Extracted debug pattern from lua script: {pattern}")
+    return pattern
+
+
+def check_rgw_debug_logs_and_reset(message_pattern=None):
+    """
+    Check RGW debug logs for lua script messages and reset debug_rgw to default level.
+    message_pattern: regex pattern to search (None = any 'Lua INFO:' messages).
+    Raises TestExecError if log checking or debug_rgw reset fails.
+    """
+    log.info("Checking RGW debug logs for lua script messages")
+    try:
+        # Get cluster FSID and log directory
+        fsid = utils.get_cluster_fsid()
+        log_dir = f"/var/log/ceph/{fsid}"
+        
+        if not os.path.exists(log_dir):
+            raise TestExecError(f"Log directory {log_dir} does not exist")
+
+        # Find all RGW log files
+        rgw_log_files = []
+        for file in os.listdir(log_dir):
+            if file.startswith("ceph-client.rgw") and file.endswith(".log"):
+                rgw_log_files.append(os.path.join(log_dir, file))
+
+        if not rgw_log_files:
+            raise TestExecError(f"No RGW log files found in {log_dir}")
+        log.info(f"Found {len(rgw_log_files)} RGW log files")
+        total_lua_messages = 0
+
+        # Search for lua debug messages in each log file
+        for log_file in rgw_log_files:
+            try:
+                if message_pattern:
+                    grep_cmd = f"grep -E '{message_pattern}' {log_file} | tail -50"
+                    log.debug(f"Searching for pattern: {message_pattern}")
+                else:
+                    grep_cmd = f"grep 'Lua INFO:' {log_file} | tail -50"
+                    log.debug("Searching for any Lua INFO messages")
+                
+                grep_output = utils.exec_shell_cmd(grep_cmd)
+
+                if grep_output:
+                    lines = grep_output.strip().split("\n")
+                    total_lua_messages += len(lines)
+                    log.info(f"Found {len(lines)} lua debug messages in {os.path.basename(log_file)}")
+                    # Log sample messages
+                    for line in lines[:5]:
+                        log.info(f"  Sample: {line}")
+            except Exception as e:
+                raise TestExecError(f"Failed to check log file {log_file}: {e}")
+        
+        if total_lua_messages == 0:
+            if message_pattern:
+                raise TestExecError(f"No lua debug messages found matching pattern '{message_pattern}' in RGW logs")
+            else:
+                raise TestExecError("No lua debug messages found in RGW logs")
+        log.info(f"Total lua debug messages found across all RGW logs: {total_lua_messages}")
+
+    except Exception as e:
+        raise TestExecError(f"Failed to check RGW debug logs: {e}")
+    
+    # Reset debug_rgw to default (remove debug level 20)
+    log.info("Resetting debug_rgw to default level")
+    try:
+        cmd_ps = "ceph orch ps --daemon_type rgw -f json"
+        out_ps = utils.exec_shell_cmd(cmd_ps)
+        rgw_daemons = json.loads(out_ps)
+        
+        for daemon in rgw_daemons:
+            daemon_name = daemon.get("service_name")
+            if daemon_name:
+                # Remove config override to reset to default
+                debug_cmd = f"ceph config rm client.{daemon_name} debug_rgw"
+                log.info(f"Resetting debug_rgw for {daemon_name}: {debug_cmd}")
+                utils.exec_shell_cmd(debug_cmd)
+        
+        log.info("debug_rgw reset to default for all RGW daemons")
+    except Exception as e:
+        raise TestExecError(f"Failed to reset debug_rgw: {e}")
+
