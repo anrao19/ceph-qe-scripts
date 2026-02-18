@@ -1,0 +1,19 @@
+# Test: obj lock LUA - Object lock enabled on bucket creation via Lua prerequest script.
+# polarion id:
+# Ref: https://docs.google.com/document/d/1eVNtrDz5P3YwruU_ZAPNRWGDMkJrH-Mv_FwBQWQ-Kf0
+# Versioned objects: yes (bucket has versioning + object lock). Optional: test_multipart for multipart upload.
+config:
+  user_count: 1
+  bucket_count: 1
+  objects_count: 2
+  local_file_delete: true
+  objects_size_range:
+    min: 5K
+    max: 10M
+  user_remove: false
+  test_ops:
+    lua_object_lock: true
+    put_default_retention: true
+    retention_days: 5
+    lock_mode: "COMPLIANCE"
+    test_multipart: true
