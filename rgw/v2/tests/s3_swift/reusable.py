@@ -4552,3 +4552,97 @@ def wait_for_head_obj_prometheus_metrics(
             )
 
     return result
+
+
+def radosgw_admin(cmd, ssh_con=None):
+    """
+    Run radosgw-admin. With ssh_con, use cephadm shell (remote RGW hosts
+    often lack /etc/ceph/ceph.conf). Returns (stdout, rc).
+    """
+    if ssh_con:
+        remote_cmd = f"sudo cephadm shell -- radosgw-admin {cmd}"
+        log.info(f"[remote] $ {remote_cmd}")
+        _, stdout, stderr = ssh_con.exec_command(remote_cmd)
+        out = stdout.read().decode(errors="replace")
+        err = stderr.read().decode(errors="replace")
+        rc = stdout.channel.recv_exit_status()
+        if out.strip():
+            for line in out.strip().splitlines():
+                log.info(f"    {line}")
+        if err.strip():
+            for line in err.strip().splitlines():
+                log.warning(f"    {line}")
+        return out, rc
+    out = utils.exec_shell_cmd(f"sudo radosgw-admin {cmd}")
+    if out is False or out is None:
+        return "", 1
+    return out, 0
+
+
+def get_metadata_sync_period_epoch(ssh_con=None):
+    """Return (period_id, realm_epoch) from metadata sync status JSON."""
+    out, rc = radosgw_admin("metadata sync status --format json", ssh_con)
+    if rc != 0 or not out:
+        return None, None
+    try:
+        data = json.loads(out.strip())
+    except (TypeError, json.JSONDecodeError):
+        return None, None
+    info = data.get("sync_status", {}).get("info", {})
+    return info.get("period"), info.get("realm_epoch")
+
+
+def assert_sync_status_no_false_caught_up(
+    label, sync_out, master_epoch, sync_epoch, expect_fixed=True, state2=False
+):
+    """
+    Fail if sync status reports 'metadata is caught up with master' while the
+    zone is on an older realm epoch (tracker #81763).
+    """
+    caught_up_msg = "metadata is caught up with master"
+    diff_period_msg = "master is on a different period"
+
+    if not sync_out or not sync_out.strip():
+        raise TestExecError(f"{label}: sync status output is empty")
+
+    caught_up = caught_up_msg in sync_out
+    diff_period = diff_period_msg in sync_out
+    epoch_lag = (
+        sync_epoch is not None
+        and master_epoch is not None
+        and sync_epoch < master_epoch
+    )
+
+    log.info(
+        f"{label}: caught_up={caught_up} diff_period={diff_period} "
+        f"master_epoch={master_epoch} sync_epoch={sync_epoch}"
+    )
+
+    if master_epoch is None or sync_epoch is None:
+        raise TestExecError(
+            f"{label}: could not read master_epoch={master_epoch} "
+            f"sync_epoch={sync_epoch} for comparison"
+        )
+
+    if not expect_fixed:
+        if caught_up and epoch_lag:
+            log.warning(f"{label}: BUG_REPRODUCED — false caught-up with epoch lag")
+        else:
+            log.info(f"{label}: no false caught-up detected")
+        return
+
+    if caught_up and epoch_lag:
+        raise TestExecError(
+            f"{label}: sync status incorrectly reports '{caught_up_msg}' "
+            f"while victim sync_epoch={sync_epoch} < master_epoch={master_epoch} "
+            f"(tracker #81763)"
+        )
+    if state2 and caught_up and diff_period:
+        raise TestExecError(
+            f"{label}: sync status reports both '{diff_period_msg}' and "
+            f"'{caught_up_msg}' (tracker #81763)"
+        )
+    if epoch_lag and not caught_up:
+        log.info(f"{label}: FIXED — lagging zone not reported as caught up")
+    else:
+        log.info(f"{label}: assertion checks passed")
