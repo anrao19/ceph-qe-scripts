@@ -1,0 +1,25 @@
+# Script: test_cors_options_preflight.py
+# Tracker: https://ibm-ceph.atlassian.net/browse/IBMCEPH-20773
+# Fix/verify: https://ibm-ceph.atlassian.net/browse/IBMCEPH-20785
+# Upstream: https://github.com/ceph/ceph/pull/72756
+# Inditex / IBMCEPH16988 hotfix regression: anonymous OPTIONS with no CORS
+# must not SIGSEGV; fixed build returns HTTP 403 AccessDenied
+# polarion_id: CEPH-83633185
+config:
+  user_count: 1
+  bucket_count: 1
+  objects_count: 1
+  objects_size_range:
+    min: 1K
+    max: 1K
+  user_remove: true
+  test_ops:
+    options_no_cors_segfault: true
+    delete_bucket: true
+    origin: "http://example.com"
+    request_method: "GET"
+    options_repeat: 3
+    expected_status: 403
+    strict: true
+    curl_timeout: 30
+    object_name: "obj"
